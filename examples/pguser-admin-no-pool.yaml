@@ -1,0 +1,23 @@
+---
+# Ejemplo: usuario admin sin entrada al pool pgbouncer.
+# Útil para herramientas que conectan directo a PG (schemahero, migraciones,
+# jobs batch) o que requieren superuser/createDb/createRole no permitidos
+# en el pool.
+apiVersion: db.docline.io/v1alpha1
+kind: XPgUser
+metadata:
+  name: schemahero
+  namespace: infra-int
+spec:
+  env: int
+  username: schemahero-int
+  passwordSecretRef:
+    name: schemahero-pg
+    namespace: infra-int
+    key: schemahero-int
+  pgbouncer:
+    enabled: false   # no entra al pool
+  privileges:
+    login: true
+    createDb: true
+    createRole: true
