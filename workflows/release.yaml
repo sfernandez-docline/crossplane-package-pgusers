@@ -1,0 +1,83 @@
+---
+# Workflow per-package para crossplane-package-pgusers.
+#
+# NOT SYNCED por ArgoCD (no listado en kustomization.yaml de este dir);
+# es una plantilla submitible vía CLI:
+#
+#   argo --kube-context control-ireland -n argo-workflows submit \
+#       packages/crossplane-package-pgusers/workflows/release.yaml \
+#       -p branch=main          # o int para prerelease
+#
+# Pipeline (DAG):
+#   release ──┐
+#             └─→ xpkg (when released)
+#
+# xflow sólo produce 1 artifact (el xpkg). Para repos con múltiples
+# artifacts (ej. databases-bootstrap = xpkg + Docker), añadir más
+# tareas en el dag con dependencies: [release].
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: release-pgusers-
+  namespace: argo-workflows
+  labels:
+    docline.io/package: crossplane-package-pgusers
+    docline.io/component: release-pipeline
+spec:
+  serviceAccountName: release-pipeline
+  podMetadata:
+    annotations:
+      karpenter.sh/do-not-disrupt: "true"
+  ttlStrategy:
+    secondsAfterCompletion: 600
+    secondsAfterSuccess: 300
+    secondsAfterFailure: 604800
+  arguments:
+    parameters:
+      - name: branch
+        value: main          # override con `argo submit -p branch=int` para prereleases
+  volumes:
+    - name: gh-pat
+      secret:
+        secretName: github-pat
+        defaultMode: 0400
+    - name: kaniko-config
+      secret:
+        secretName: github-pat
+        items:
+          - { key: .dockerconfigjson, path: config.json }
+        defaultMode: 0400
+  entrypoint: pipeline
+  templates:
+    - name: pipeline
+      dag:
+        tasks:
+          - name: release
+            templateRef:
+              name: release-base
+              template: release
+            arguments:
+              parameters:
+                - name: repoURL
+                  value: "https://github.com/sfernandez-docline/crossplane-package-pgusers.git"
+                - name: branch
+                  value: "{{workflow.parameters.branch}}"
+
+          - name: xpkg
+            depends: "release.Succeeded"
+            when: '{{tasks.release.outputs.parameters.released}} == true'
+            templateRef:
+              name: build-xpkg
+              template: build-and-push
+            arguments:
+              parameters:
+                - name: repoURL
+                  value: "https://github.com/sfernandez-docline/crossplane-package-pgusers.git"
+                - name: branch
+                  value: "{{workflow.parameters.branch}}"
+                - name: version
+                  value: "{{tasks.release.outputs.parameters.version}}"
+                - name: packageName
+                  value: "crossplane-package-pgusers"
+                - name: packageRoot
+                  value: "."

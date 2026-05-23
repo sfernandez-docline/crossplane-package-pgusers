@@ -1,0 +1,38 @@
+apiVersion: meta.pkg.crossplane.io/v1
+kind: Configuration
+metadata:
+  name: crossplane-package-pgusers
+  annotations:
+    meta.crossplane.io/maintainer: "Docline platform"
+    meta.crossplane.io/license: "Apache-2.0"
+    meta.crossplane.io/description: |
+      XRD XPgUser + Composition `pguser` para gestión declarativa de usuarios
+      PostgreSQL con integración opcional al pool pgbouncer.
+
+      Modelo:
+        - El caller mantiene un Secret K8s con la password (típicamente vía
+          InfisicalSecret bridge en crossplane-system; cualquier ns vale).
+        - Un XPgUser claim referencia ese Secret y declara: env, username,
+          (opcional) database, (opcional) privilegios, y si entra al pool.
+        - La Composition emite:
+            1. Role CR provider-sql (crea el role en PG con la password).
+            2. (Si pgbouncer.enabled) patch del Secret origen añadiendo
+               labels `pgbouncer.docline.io/enabled=true` +
+               `pgbouncer.docline.io/env=<env>` + annotations Reflector →
+               el Secret se replica a ns `pgbouncer`, donde el sidecar
+               userlist-reloader del Deployment pgbouncer-<env> lo recoge
+               vía label-watch y manda SIGHUP (reload zero-downtime).
+            3. (Si database set) Database + Grant <adminRole> MEMBER OF user.
+
+      Add/remove de usuarios sin restart del pool. Add/remove desde cualquier
+      ns/repo. Toggle del pool sin tocar PG (solo cambia las labels).
+spec:
+  crossplane:
+    version: ">=v1.18.0-0"
+  dependsOn:
+    - function: xpkg.upbound.io/crossplane-contrib/function-kcl
+      version: "v0.12.1"
+    - provider: xpkg.upbound.io/crossplane-contrib/provider-sql
+      version: "v0.14.0"
+    - provider: xpkg.upbound.io/crossplane-contrib/provider-kubernetes
+      version: ">=v0.14.0,<v2.0.0"

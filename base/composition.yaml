@@ -1,0 +1,200 @@
+apiVersion: apiextensions.crossplane.io/v1
+kind: Composition
+metadata:
+  name: pguser
+  labels:
+    type: db
+spec:
+  compositeTypeRef:
+    apiVersion: db.docline.io/v1alpha1
+    kind: XPgUser
+  mode: Pipeline
+  pipeline:
+    - functionRef:
+        name: function-kcl
+      input:
+        apiVersion: kcl.fn.crossplane.io/v1beta1
+        kind: KCLInput
+        spec:
+          source: |
+            # XPgUser Composition: Role provider-sql + (opt) DB+Grant +
+            # (opt) patch del Secret origen con labels pgbouncer.
+            #
+            # ─────────────────────────────────────────────────────────────
+            # Decisión arquitectónica: integración pool via PATCH del Secret
+            # origen (no copia). La Composition declara solo .metadata.labels
+            # + .metadata.annotations; .data queda intacto (provider-kubernetes
+            # Object con managementPolicies sin Delete + manifest metadata-only).
+            # Reflector ve los annotations y replica a ns pgbouncer; el sidecar
+            # del Deployment pgbouncer-<env> match las dos labels y SIGHUP.
+            # ─────────────────────────────────────────────────────────────
+            spec   = option("params").oxr.spec
+            env    = spec.env
+            user   = spec.username
+            ref    = spec.passwordSecretRef
+            climit = spec.connectionLimit if "connectionLimit" in spec else -1
+
+            # Defaults para pgbouncer.enabled (default True)
+            _pgb        = spec.pgbouncer    if "pgbouncer"  in spec else {}
+            pgb_enabled = _pgb.enabled      if "enabled"    in _pgb else True
+
+            # Defaults para privileges
+            _privs       = spec.privileges if "privileges" in spec else {}
+            priv_login   = _privs.login       if "login"       in _privs else True
+            priv_createDb= _privs.createDb    if "createDb"    in _privs else False
+            priv_createR = _privs.createRole  if "createRole"  in _privs else False
+            priv_inherit = _privs.inherit     if "inherit"     in _privs else True
+            priv_super   = _privs.superuser   if "superuser"   in _privs else False
+            priv_repl    = _privs.replication if "replication" in _privs else False
+            priv_bypass  = _privs.bypassRls   if "bypassRls"   in _privs else False
+
+            # 1) Role CR provider-sql ───────────────────────────────────────
+            _role = {
+                apiVersion = "postgresql.sql.m.crossplane.io/v1alpha1"
+                kind = "Role"
+                metadata = {
+                    name = user
+                    annotations = {
+                        "krm.kcl.dev/composition-resource-name" = "role"
+                        "krm.kcl.dev/ready" = "True"
+                    }
+                }
+                spec = {
+                    providerConfigRef = {kind = "ClusterProviderConfig", name = "default"}
+                    forProvider = {
+                        connectionLimit = climit
+                        # NOTA: el CRD upstream NO acepta `namespace` en
+                        # passwordSecretRef — provider-sql busca el Secret en
+                        # SU PROPIO ns (`crossplane-system`). Si el caller declara
+                        # passwordSecretRef.namespace != crossplane-system, lo
+                        # ignoramos aquí y dejamos que el Object Reflector-patch
+                        # haga el trabajo de mover/reflejar el Secret. Ver TODO.
+                        passwordSecretRef = {
+                            name = ref.name
+                            key = ref.key
+                        }
+                        privileges = {
+                            login = priv_login
+                            createDb = priv_createDb
+                            createRole = priv_createR
+                            inherit = priv_inherit
+                            # CRD usa camelCase `superUser` (upstream provider-sql).
+                            superUser = priv_super
+                            replication = priv_repl
+                            bypassRls = priv_bypass
+                        }
+                    }
+                }
+            }
+
+            # 2) Secret en ns pgbouncer con labels + data inyectada ─────────
+            # En lugar de delegar la copia a Reflector (que NO propaga labels
+            # — feedback_reflector_no_labels.md), creamos directamente el Secret
+            # en pgbouncer ns con:
+            #   - labels que el sidecar matchea (enabled + env)
+            #   - data poblada via spec.references.patchesFrom desde el Secret
+            #     origen (provider-kubernetes lee `data.<key>` del origen y lo
+            #     inyecta literal en `data.<username>` del destino, preservando
+            #     el base64 encoding).
+            # Nombre del Secret destino: `pguser-<username>` (evita colisiones
+            # con Secrets ya existentes en pgbouncer ns como pg-env-roles-*).
+            # Cuando el XPgUser se borra, este Object también — Crossplane gestiona
+            # el lifecycle. Limpieza automática del pool sin código extra.
+            _pgb_secret = {
+                apiVersion = "kubernetes.m.crossplane.io/v1alpha1"
+                kind = "Object"
+                metadata = {
+                    name = "pguser-pgb-" + user
+                    annotations = {
+                        "krm.kcl.dev/composition-resource-name" = "pgb-secret"
+                        "krm.kcl.dev/ready" = "True"
+                    }
+                }
+                spec = {
+                    providerConfigRef = {kind = "ClusterProviderConfig", name = "default"}
+                    references = [{
+                        patchesFrom = {
+                            apiVersion = "v1"
+                            kind = "Secret"
+                            namespace = ref.namespace
+                            name = ref.name
+                            fieldPath = "data." + ref.key
+                        }
+                        toFieldPath = "data." + user
+                    }]
+                    forProvider = {
+                        manifest = {
+                            apiVersion = "v1"
+                            kind = "Secret"
+                            type = "Opaque"
+                            metadata = {
+                                name = "pguser-" + user
+                                namespace = "pgbouncer"
+                                labels = {
+                                    "pgbouncer.docline.io/enabled" = "true"
+                                    "pgbouncer.docline.io/env" = env
+                                    "pgbouncer.docline.io/source" = "xpguser"
+                                }
+                            }
+                            # data se rellena via references.patchesFrom; aquí
+                            # un placeholder vacío para que kubectl no rechace
+                            # el manifest por "type=Opaque without data".
+                            data = {
+                                "${user}" = ""
+                            }
+                        }
+                    }
+                }
+            } if pgb_enabled else None
+
+            # 3) Database + Grant si spec.database está set ────────────────
+            _has_db = "database" in spec and spec.database != None
+            _db_name = spec.database.name if _has_db else ""
+            _admin_role = spec.database.adminRole if _has_db and "adminRole" in spec.database else "useradmin"
+
+            _db_items = [
+                {
+                    apiVersion = "postgresql.sql.m.crossplane.io/v1alpha1"
+                    kind = "Database"
+                    metadata = {
+                        name = _db_name
+                        annotations = {
+                            "krm.kcl.dev/composition-resource-name" = "database"
+                            "krm.kcl.dev/ready" = "True"
+                        }
+                    }
+                    spec = {
+                        providerConfigRef = {kind = "ClusterProviderConfig", name = "default"}
+                        forProvider = {
+                            allowConnections = True
+                            connectionLimit = -1
+                            encoding = "UTF8"
+                            isTemplate = False
+                            lcCType = "en_US.UTF-8"
+                            lcCollate = "en_US.UTF-8"
+                            owner = user
+                        }
+                    }
+                }
+                {
+                    apiVersion = "postgresql.sql.m.crossplane.io/v1alpha1"
+                    kind = "Grant"
+                    metadata = {
+                        name = _admin_role + "-member-" + user
+                        annotations = {
+                            "krm.kcl.dev/composition-resource-name" = "grant-admin"
+                            "krm.kcl.dev/ready" = "True"
+                        }
+                    }
+                    spec = {
+                        providerConfigRef = {kind = "ClusterProviderConfig", name = "default"}
+                        forProvider = {
+                            memberOf = user
+                            role = _admin_role
+                        }
+                    }
+                }
+            ] if _has_db else []
+
+            items = [_role] + ([_pgb_secret] if _pgb_secret != None else []) + _db_items
+      step: render-pguser

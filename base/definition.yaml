@@ -1,0 +1,124 @@
+apiVersion: apiextensions.crossplane.io/v2
+kind: CompositeResourceDefinition
+metadata:
+  name: xpgusers.db.docline.io
+spec:
+  group: db.docline.io
+  scope: Namespaced
+  names:
+    kind: XPgUser
+    plural: xpgusers
+  defaultCompositionUpdatePolicy: Automatic
+  versions:
+    - name: v1alpha1
+      served: true
+      referenceable: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              required: [env, username, passwordSecretRef]
+              properties:
+                env:
+                  type: string
+                  description: |
+                    Slug del entorno PG (int, qa, staging, prod-morocco).
+                    Determina la label `pgbouncer.docline.io/env` que aísla
+                    el user en el pool del Deployment pgbouncer-<env>.
+                  pattern: '^[a-z][a-z0-9-]{1,40}$'
+                username:
+                  type: string
+                  description: |
+                    Nombre exacto del Role en PG (no se transforma). Convención
+                    interna: `<app>-<env>` (p.ej. `ms-marketplace-int`).
+                  pattern: '^[a-zA-Z_][a-zA-Z0-9_-]{0,62}$'
+                passwordSecretRef:
+                  type: object
+                  required: [name, namespace, key]
+                  description: |
+                    Secret K8s que contiene la password. El caller lo crea —
+                    típicamente via InfisicalSecret bridge en crossplane-system,
+                    pero cualquier ns es válido.
+                    La Composition NO escribe en `.data`; sólo PATCHEA labels y
+                    annotations en `.metadata` para activar reflection a ns
+                    pgbouncer. Si el caller borra esas labels después, el user
+                    sale del pool.
+                  properties:
+                    name: { type: string }
+                    namespace: { type: string }
+                    key:
+                      type: string
+                      description: |
+                        Key dentro del Secret donde está la password. Por
+                        convención SE USA EL MISMO valor que `username` para
+                        que el sidecar (que genera "key" → entry de userlist)
+                        produzca el username correcto. Si difieren, el sidecar
+                        usará la key como username — confusing pero técnicamente
+                        funcional. RECOMENDADO: key == username.
+                pgbouncer:
+                  type: object
+                  description: Configuración del acceso al pool pgbouncer-<env>.
+                  properties:
+                    enabled:
+                      type: boolean
+                      default: true
+                      description: |
+                        Si true (default): el Secret origen se patchea con las
+                        labels Reflector + las dos labels pgbouncer.docline.io.
+                        Si false: solo Role en PG, sin entrada al pool. Útil
+                        para users de admin (schemahero, jobs batch) o users
+                        que conectan directo al PG (no por pgbouncer).
+                database:
+                  type: object
+                  description: |
+                    Si presente, la Composition crea una Database con este
+                    Role como owner + un Grant `<adminRole>` MEMBER OF user
+                    para que el admin pueda gestionar la DB.
+                  properties:
+                    name:
+                      type: string
+                      pattern: '^[a-z][a-z0-9_-]{1,62}$'
+                    adminRole:
+                      type: string
+                      default: useradmin
+                      description: |
+                        Role admin que recibe MEMBER OF. prod-morocco usa
+                        "postgres" (OCI managed PG master); el resto de envs
+                        usan "useradmin" (Pulumi-provisioned).
+                  required: [name]
+                privileges:
+                  type: object
+                  description: Flags forProvider.privileges del Role CR.
+                  properties:
+                    login:       { type: boolean, default: true }
+                    createDb:    { type: boolean, default: false }
+                    createRole:  { type: boolean, default: false }
+                    inherit:     { type: boolean, default: true }
+                    superuser:   { type: boolean, default: false }
+                    replication: { type: boolean, default: false }
+                    bypassRls:   { type: boolean, default: false }
+                connectionLimit:
+                  type: integer
+                  default: -1
+                  description: |
+                    PG connection limit del role. -1 = ilimitado. Cuando se
+                    conecta por pgbouncer es razonable dejarlo en -1 porque
+                    pgbouncer ya enforce max_db_connections.
+            status:
+              type: object
+              properties:
+                roleName:
+                  type: string
+                pgbouncerEnabled:
+                  type: boolean
+                conditions:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      type:    { type: string }
+                      status:  { type: string }
+                      reason:  { type: string }
+                      message: { type: string }

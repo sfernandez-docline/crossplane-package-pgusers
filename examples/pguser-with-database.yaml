@@ -1,0 +1,45 @@
+---
+# Ejemplo: usuario con su propia DB + entrada en el pool pgbouncer-int.
+# Pre-requisito: Secret `ms-marketplace-pg` debe existir en crossplane-system
+# con key=ms-marketplace-int conteniendo la password (típico: InfisicalSecret
+# bridge en el repo de la app o en zones/non-live/cluster/).
+apiVersion: db.docline.io/v1alpha1
+kind: XPgUser
+metadata:
+  name: ms-marketplace
+  namespace: infra-int
+spec:
+  env: int
+  username: ms-marketplace-int
+  passwordSecretRef:
+    name: ms-marketplace-pg
+    namespace: crossplane-system
+    key: ms-marketplace-int
+  pgbouncer:
+    enabled: true
+  database:
+    name: ms-marketplace-int
+    adminRole: useradmin
+  privileges:
+    login: true
+---
+# Ejemplo: usuario admin SIN pool (schemahero, jobs batch).
+# Solo crea el Role en PG con createDb/createRole; conecta directo al PG,
+# no por pgbouncer.
+apiVersion: db.docline.io/v1alpha1
+kind: XPgUser
+metadata:
+  name: schemahero-int
+  namespace: infra-int
+spec:
+  env: int
+  username: schemahero-int
+  passwordSecretRef:
+    name: schemahero-pg
+    namespace: crossplane-system
+    key: schemahero-int
+  pgbouncer:
+    enabled: false
+  privileges:
+    login: true
+    createDb: true
